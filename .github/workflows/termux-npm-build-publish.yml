@@ -6,8 +6,8 @@
 name: termux-npm-build-publish
 
 on:
-  pull_request:
-    branches: [main]
+  # For a PR, dispatch this workflow with its branch as the ref when an Android
+  # artifact is needed. CI/documentation-only pushes do not rebuild the payload.
   push:
     branches:
       - main
