@@ -325,6 +325,8 @@ struct WebsocketContinuation {
 
 #[derive(Debug, Default)]
 struct WebsocketSession {
+    /// A late turn must not restore continuation state invalidated by fallback.
+    recovery_generation: u64,
     connection: Option<ApiWebSocketConnection>,
     responses_headers: ApiHeaderMap,
     /// Owner of the cached state, including before a connection is opened.
@@ -423,6 +425,7 @@ impl WebsocketSession {
             .continuation_reset_reason
             .or_else(|| self.last_request.as_ref().and(reason));
         *self = Self {
+            recovery_generation: self.recovery_generation,
             auth_owner_generation: self.auth_owner_generation,
             continuation_reset_reason,
             ..Default::default()
@@ -638,15 +641,36 @@ impl ModelClient {
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
+        let recovery = self
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut cached_websocket_session = self
             .state
             .cached_websocket_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
+        let session = std::mem::take(&mut *cached_websocket_session);
+        if session.recovery_generation == recovery.generation() {
+            session
+        } else {
+            WebsocketSession {
+                recovery_generation: recovery.generation(),
+                ..Default::default()
+            }
+        }
     }
 
     fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
+        let recovery = self
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if websocket_session.recovery_generation != recovery.generation() {
+            return;
+        }
         *self
             .state
             .cached_websocket_session
@@ -654,18 +678,37 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
+    fn websocket_recovery_generation(&self) -> u64 {
+        self.state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation()
+    }
+
     pub(crate) fn force_http_fallback(
         &self,
         session_telemetry: &SessionTelemetry,
         _model_info: &ModelInfo,
     ) -> bool {
-        let activated = self.state.provider.info().supports_websockets
-            && self
+        let activated = {
+            let mut recovery = self
                 .state
                 .websocket_recovery
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .activate_fallback(Instant::now());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let activated = self.state.provider.info().supports_websockets
+                && recovery.activate_fallback(Instant::now());
+            *self
+                .state
+                .cached_websocket_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = WebsocketSession {
+                recovery_generation: recovery.generation(),
+                ..Default::default()
+            };
+            activated
+        };
         if activated {
             warn!("falling back to HTTP");
             session_telemetry.counter(
@@ -675,7 +718,6 @@ impl ModelClient {
             );
         }
 
-        self.store_cached_websocket_session(WebsocketSession::default());
         activated
     }
 
@@ -1872,6 +1914,16 @@ impl ModelClientSession {
         inference_trace: &InferenceTraceContext,
         websocket_completion: Option<WebsocketCompletion>,
     ) -> Result<WebsocketStreamOutcome> {
+        let recovery_generation = websocket_completion.as_ref().map_or_else(
+            || self.client.websocket_recovery_generation(),
+            |completion| completion.generation,
+        );
+        if self.websocket_session.recovery_generation != recovery_generation {
+            self.websocket_session = WebsocketSession {
+                recovery_generation,
+                ..Default::default()
+            };
+        }
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -2314,7 +2366,10 @@ impl ModelClientSession {
         let activated = self
             .client
             .force_http_fallback(session_telemetry, model_info);
-        self.websocket_session = WebsocketSession::default();
+        self.websocket_session = WebsocketSession {
+            recovery_generation: self.client.websocket_recovery_generation(),
+            ..Default::default()
+        };
         activated
     }
 }

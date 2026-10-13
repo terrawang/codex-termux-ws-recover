@@ -256,6 +256,36 @@ async fn websocket_recovery_resets_cooldown_only_for_completed_generation() {
     }
 }
 
+#[test]
+fn websocket_recovery_late_turn_drop_cannot_restore_invalidated_continuation() {
+    let client = test_websocket_model_client();
+    let mut old_turn = client.new_session();
+    old_turn
+        .websocket_session
+        .last_response_from_untraced_warmup = true;
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    old_turn.websocket_session.last_response_rx = Some(rx);
+    let mut failing_turn = client.new_session();
+    assert!(
+        failing_turn.try_switch_fallback_transport(&test_session_telemetry(), &test_model_info(),)
+    );
+    // An in-flight turn can finish and drop after another turn activates HTTP.
+    // Its old cached response/connection must stay invalidated for recovery.
+    drop(old_turn);
+    let next_turn = client.new_session();
+    assert!(
+        !next_turn
+            .websocket_session
+            .last_response_from_untraced_warmup
+    );
+    assert!(next_turn.websocket_session.last_response_rx.is_none());
+    assert_eq!(
+        next_turn.websocket_session.recovery_generation,
+        client.websocket_recovery_generation(),
+    );
+    assert!(!client.responses_websocket_enabled());
+}
+
 #[tokio::test]
 async fn websocket_recovery_does_not_interrupt_an_active_http_stream() {
     let client = test_websocket_model_client();
