@@ -113,7 +113,18 @@ fn test_model_client_with_thread_id(
     thread_id: ThreadId,
     session_source: SessionSource,
 ) -> ModelClient {
-    let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    test_model_client_with_provider(
+        thread_id,
+        session_source,
+        create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses),
+    )
+}
+
+fn test_model_client_with_provider(
+    thread_id: ThreadId,
+    session_source: SessionSource,
+    provider: ModelProviderInfo,
+) -> ModelClient {
     ModelClient::new(
         /*auth_manager*/ None,
         AgentIdentityAuthPolicy::JwtOnly,
@@ -139,6 +150,204 @@ fn test_model_client_with_thread_id(
 
 fn test_model_provider() -> SharedModelProvider {
     test_model_client(SessionSource::Cli).state.provider.clone()
+}
+
+fn test_websocket_model_client() -> ModelClient {
+    let mut provider =
+        create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    provider.supports_websockets = true;
+    test_model_client_with_provider(ThreadId::new(), SessionSource::Cli, provider)
+}
+
+fn completed_event() -> ResponseEvent {
+    ResponseEvent::Completed {
+        response_id: "recovered-response".to_string(),
+        token_usage: None,
+        usage_metadata: None,
+        end_turn: Some(true),
+    }
+}
+
+#[test]
+fn websocket_recovery_is_shared_across_turns_but_respects_provider_capability() {
+    let client = test_websocket_model_client();
+    let telemetry = test_session_telemetry();
+    let model = test_model_info();
+    let mut turn = client.new_session();
+    let clone = client.clone();
+    turn.turn_state
+        .set("sticky-current-turn".to_string())
+        .unwrap();
+    turn.websocket_session.last_response_from_untraced_warmup = true;
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    turn.websocket_session.last_response_rx = Some(rx);
+    assert!(turn.try_switch_fallback_transport(&telemetry, &model));
+    assert!(!clone.responses_websocket_enabled());
+    assert!(!turn.try_switch_fallback_transport(&telemetry, &model));
+    assert!(turn.websocket_session.connection.is_none());
+    assert!(turn.websocket_session.last_request.is_none());
+    assert!(turn.websocket_session.last_response_rx.is_none());
+    assert!(!turn.websocket_session.last_response_from_untraced_warmup);
+    assert_eq!(
+        turn.turn_state.get().map(String::as_str),
+        Some("sticky-current-turn")
+    );
+    drop(turn);
+    let next_turn = client.new_session();
+    assert!(!next_turn.client.responses_websocket_enabled());
+    assert!(next_turn.turn_state.get().is_none());
+    assert!(next_turn.websocket_session.last_response_rx.is_none());
+    assert!(test_websocket_model_client().responses_websocket_enabled());
+    let http_only = test_model_client(SessionSource::Cli);
+    assert!(!http_only.responses_websocket_enabled());
+    assert!(!http_only.force_http_fallback(&telemetry, &model));
+}
+
+#[tokio::test]
+async fn websocket_recovery_resets_cooldown_only_for_completed_generation() {
+    // A handshake, partial output, EOF, stream error, and successful HTTP response
+    // are not proof that WebSocket inference has recovered.
+    for (is_websocket, events, resets_cooldown) in [
+        (true, vec![Ok(completed_event())], true),
+        (false, vec![Ok(completed_event())], false),
+        (true, vec![], false),
+        (
+            true,
+            vec![Ok(ResponseEvent::OutputItemDone(output_message(
+                "1", "partial",
+            )))],
+            false,
+        ),
+        (
+            true,
+            vec![Err(ApiError::Stream("disconnected".to_string()))],
+            false,
+        ),
+    ] {
+        let client = test_websocket_model_client();
+        client
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap()
+            .activate_fallback(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        assert!(client.responses_websocket_enabled());
+        let completion = is_websocket.then(|| super::WebsocketCompletion::new(&client));
+        let (mut stream, _) = super::map_response_events(
+            None,
+            futures::stream::iter(events),
+            test_session_telemetry(),
+            InferenceTraceAttempt::disabled(),
+            Arc::clone(&client.state.provider),
+            completion,
+        );
+        while stream.next().await.is_some() {}
+        assert!(client.force_http_fallback(&test_session_telemetry(), &test_model_info()));
+        assert_eq!(
+            client
+                .state
+                .websocket_recovery
+                .lock()
+                .unwrap()
+                .enabled(std::time::Instant::now() + std::time::Duration::from_secs(61),),
+            resets_cooldown,
+        );
+    }
+}
+
+#[tokio::test]
+async fn websocket_recovery_does_not_interrupt_an_active_http_stream() {
+    let client = test_websocket_model_client();
+    let telemetry = test_session_telemetry();
+    assert!(client.force_http_fallback(&telemetry, &test_model_info()));
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (mut stream, _) = super::map_response_events(
+        None,
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })),
+        telemetry,
+        InferenceTraceAttempt::disabled(),
+        Arc::clone(&client.state.provider),
+        None,
+    );
+    tx.send(Ok(ResponseEvent::OutputItemDone(output_message(
+        "1", "partial",
+    ))))
+    .await
+    .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::OutputItemDone(_)))
+    ));
+    assert!(
+        client
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap()
+            .enabled(std::time::Instant::now() + std::time::Duration::from_secs(61),)
+    );
+    tx.send(Ok(completed_event())).await.unwrap();
+    drop(tx);
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ResponseEvent::Completed { .. }))
+    ));
+    assert!(stream.next().await.is_none());
+    assert!(!client.responses_websocket_enabled());
+}
+
+#[tokio::test]
+async fn websocket_recovery_ignores_completed_from_an_older_stream() {
+    let client = test_websocket_model_client();
+    let completion = super::WebsocketCompletion::new(&client);
+    assert!(client.force_http_fallback(&test_session_telemetry(), &test_model_info()));
+    let (mut stream, _) = super::map_response_events(
+        None,
+        futures::stream::iter([Ok(completed_event())]),
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        Arc::clone(&client.state.provider),
+        Some(completion),
+    );
+    while stream.next().await.is_some() {}
+    assert!(!client.responses_websocket_enabled());
+}
+
+#[tokio::test]
+async fn websocket_recovery_cancelled_stream_keeps_cooldown_sequence() {
+    let client = test_websocket_model_client();
+    client
+        .state
+        .websocket_recovery
+        .lock()
+        .unwrap()
+        .activate_fallback(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    let events = futures::stream::iter([Ok(ResponseEvent::OutputItemDone(output_message(
+        "1", "partial",
+    )))])
+    .chain(futures::stream::pending());
+    let (mut stream, last_response) = super::map_response_events(
+        None,
+        events,
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        Arc::clone(&client.state.provider),
+        Some(super::WebsocketCompletion::new(&client)),
+    );
+    assert!(stream.next().await.is_some());
+    drop(stream);
+    assert!(last_response.await.is_err());
+    assert!(client.force_http_fallback(&test_session_telemetry(), &test_model_info()));
+    assert!(
+        !client
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap()
+            .enabled(std::time::Instant::now() + std::time::Duration::from_secs(61),)
+    );
 }
 
 #[tokio::test]
@@ -1565,6 +1774,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        None,
     );
 
     let observed = stream
@@ -1616,6 +1826,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
+        None,
     );
 
     while stream.next().await.is_some() {}
@@ -1839,6 +2050,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output
@@ -2135,6 +2347,7 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        None,
         vec![Box::new(ReplaceOutput)],
     );
     let mut delivered = Vec::new();
