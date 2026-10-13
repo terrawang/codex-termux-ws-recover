@@ -1870,8 +1870,8 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        websocket_completion: Option<WebsocketCompletion>,
     ) -> Result<WebsocketStreamOutcome> {
-        let websocket_completion = (!warmup).then(|| WebsocketCompletion::new(&self.client));
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -2213,6 +2213,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                None,
             )
             .await
         {
@@ -2258,7 +2259,7 @@ impl ModelClientSession {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
+                if let Some(websocket_completion) = WebsocketCompletion::new(&self.client) {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2272,6 +2273,7 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            Some(websocket_completion),
                         )
                         .await?
                     {
@@ -2383,17 +2385,21 @@ struct WebsocketCompletion {
 }
 
 impl WebsocketCompletion {
-    fn new(client: &ModelClient) -> Self {
-        let generation = client
+    /// Select transport and capture its generation under the same lock. A concurrent
+    /// fallback between selection and connection must not label this as a new stream.
+    fn new(client: &ModelClient) -> Option<Self> {
+        if !client.state.provider.info().supports_websockets {
+            return None;
+        }
+        let recovery = client
             .state
             .websocket_recovery
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generation();
-        Self {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.enabled(Instant::now()).then(|| Self {
             state: Arc::clone(&client.state),
-            generation,
-        }
+            generation: recovery.generation(),
+        })
     }
 
     fn record_completed(&self) {

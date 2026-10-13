@@ -183,6 +183,7 @@ fn websocket_recovery_is_shared_across_turns_but_respects_provider_capability() 
     turn.websocket_session.last_response_rx = Some(rx);
     assert!(turn.try_switch_fallback_transport(&telemetry, &model));
     assert!(!clone.responses_websocket_enabled());
+    assert!(super::WebsocketCompletion::new(&clone).is_none());
     assert!(!turn.try_switch_fallback_transport(&telemetry, &model));
     assert!(turn.websocket_session.connection.is_none());
     assert!(turn.websocket_session.last_request.is_none());
@@ -232,7 +233,7 @@ async fn websocket_recovery_resets_cooldown_only_for_completed_generation() {
             .unwrap()
             .activate_fallback(std::time::Instant::now() - std::time::Duration::from_secs(60));
         assert!(client.responses_websocket_enabled());
-        let completion = is_websocket.then(|| super::WebsocketCompletion::new(&client));
+        let completion = is_websocket.then(|| super::WebsocketCompletion::new(&client).unwrap());
         let (mut stream, _) = super::map_response_events(
             None,
             futures::stream::iter(events),
@@ -301,7 +302,7 @@ async fn websocket_recovery_does_not_interrupt_an_active_http_stream() {
 #[tokio::test]
 async fn websocket_recovery_ignores_completed_from_an_older_stream() {
     let client = test_websocket_model_client();
-    let completion = super::WebsocketCompletion::new(&client);
+    let completion = super::WebsocketCompletion::new(&client).unwrap();
     assert!(client.force_http_fallback(&test_session_telemetry(), &test_model_info()));
     let (mut stream, _) = super::map_response_events(
         None,
@@ -334,7 +335,7 @@ async fn websocket_recovery_cancelled_stream_keeps_cooldown_sequence() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         Arc::clone(&client.state.provider),
-        Some(super::WebsocketCompletion::new(&client)),
+        super::WebsocketCompletion::new(&client),
     );
     assert!(stream.next().await.is_some());
     drop(stream);
