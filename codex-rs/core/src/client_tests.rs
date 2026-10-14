@@ -169,6 +169,440 @@ fn completed_event() -> ResponseEvent {
 }
 
 #[test]
+fn compaction_reconnect_clears_stale_cache_and_preserves_turn_and_tools() {
+    let client = test_websocket_model_client();
+    let thread_id = client.state.thread_id;
+    let tools: Arc<[ToolSpec]> = Arc::from(Vec::new());
+    *client.state.last_inference_tools.lock().unwrap() = Some(Arc::clone(&tools));
+    let mut old_turn = client.new_session();
+    old_turn.turn_state.set("sticky-turn".into()).unwrap();
+    old_turn
+        .websocket_session
+        .last_response_from_untraced_warmup = true;
+    client.force_http_fallback(&test_session_telemetry(), &test_model_info());
+    client.schedule_websocket_reconnect_after_compaction();
+    assert!(!client.websocket_prewarm_allowed());
+    assert!(super::WebsocketCompletion::new(&client, false).is_none());
+    assert!(
+        client
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap()
+            .compaction_reconnect_pending()
+    );
+    let attempt = super::WebsocketCompletion::new(&client, true).unwrap();
+    assert!(attempt.compaction_attempt.is_some());
+    assert!(client.responses_websocket_enabled());
+    assert!(
+        !super::WebsocketCompletion::new(&client, true)
+            .unwrap()
+            .compaction_attempt
+            .is_some()
+    );
+    assert_eq!(
+        old_turn.turn_state.get().map(String::as_str),
+        Some("sticky-turn")
+    );
+    drop(old_turn);
+    assert!(
+        !client
+            .new_session()
+            .websocket_session
+            .last_response_from_untraced_warmup
+    );
+    assert_eq!(client.state.thread_id, thread_id);
+    assert!(Arc::ptr_eq(
+        client
+            .state
+            .last_inference_tools
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap(),
+        &tools
+    ));
+    let http_only = test_model_client(SessionSource::Cli);
+    http_only.schedule_websocket_reconnect_after_compaction();
+    assert!(
+        !http_only
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap()
+            .compaction_reconnect_pending()
+    );
+}
+
+fn compact_test_metadata() -> CodexResponsesMetadata {
+    CodexResponsesMetadata::new(
+        TEST_INSTALLATION_ID.into(),
+        TEST_INSTALLATION_ID.into(),
+        TEST_INSTALLATION_ID.into(),
+        "test:0".into(),
+    )
+}
+
+#[tokio::test]
+async fn token_budget_compaction_schedules_reconnect_without_model_requests() {
+    let server = MockServer::start().await;
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.supports_websockets = true;
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            Vec::new(),
+            move |config| {
+                config.model = Some("gpt-5.2".into());
+                config.model_provider = provider;
+            },
+        )
+        .await;
+    let client = &session.services.model_client;
+    client.force_http_fallback(&test_session_telemetry(), &test_model_info());
+    let step = session
+        .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let world = Arc::new(
+        session
+            .build_world_state_for_step(&step, true)
+            .await
+            .unwrap(),
+    );
+    crate::compact_token_budget::run_manual_compact_task(Arc::clone(&session), step, world)
+        .await
+        .unwrap();
+    assert!(
+        super::WebsocketCompletion::new(client, true)
+            .unwrap()
+            .compaction_attempt
+            .is_some()
+    );
+    assert!(client.responses_websocket_enabled());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn old_compaction_attempt_failure_cannot_cancel_a_new_pending_reconnect() {
+    let client = test_websocket_model_client();
+    client.schedule_websocket_reconnect_after_compaction();
+    let completion = super::WebsocketCompletion::new(&client, true).unwrap();
+    let mut session = client.new_session();
+    session.compaction_attempt = completion.compaction_attempt;
+    client.schedule_websocket_reconnect_after_compaction();
+    assert!(!session.try_switch_compaction_fallback_transport(&test_session_telemetry()));
+    assert!(
+        super::WebsocketCompletion::new(&client, true)
+            .unwrap()
+            .compaction_attempt
+            .is_some()
+    );
+}
+
+async fn stream_compaction_test_prompt(
+    session: &mut super::ModelClientSession,
+    input: Vec<ResponseItem>,
+) {
+    let prompt = Prompt {
+        input,
+        base_instructions: BaseInstructions {
+            text: String::new(),
+            provenance: None,
+        },
+        ..Default::default()
+    };
+    let mut stream = session
+        .stream(
+            &prompt,
+            &test_model_info(),
+            &test_session_telemetry(),
+            None,
+            codex_protocol::config_types::ReasoningSummary::Auto,
+            None,
+            &compact_test_metadata(),
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .unwrap();
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), ResponseEvent::Completed { .. }) {
+            completed = true;
+        }
+    }
+    assert!(completed);
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn compaction_reconnect_closes_old_socket_and_sends_full_context_once() {
+    use core_test_support::responses::{
+        WebSocketConnectionConfig, ev_completed, ev_response_created,
+        start_websocket_server_with_headers,
+    };
+    let server = start_websocket_server_with_headers(vec![
+        WebSocketConnectionConfig {
+            // The unused slot keeps the peer reading until the client closes it.
+            // A reconnect must not send another request on this old socket.
+            requests: vec![
+                vec![ev_response_created("old"), ev_completed("old")],
+                Vec::new(),
+            ],
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: true,
+        },
+        WebSocketConnectionConfig {
+            requests: vec![
+                vec![ev_response_created("fresh"), ev_completed("fresh")],
+                vec![ev_response_created("continued"), ev_completed("continued")],
+            ],
+            response_headers: Vec::new(),
+            accept_delay: None,
+            close_after_requests: false,
+        },
+    ])
+    .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = test_model_client_with_provider(ThreadId::new(), SessionSource::Cli, provider);
+    let mut session = client.new_session();
+    stream_compaction_test_prompt(
+        &mut session,
+        vec![output_message("old-input", "large old history")],
+    )
+    .await;
+    client.schedule_websocket_reconnect_after_compaction();
+    session
+        .preconnect_websocket(
+            &test_model_info(),
+            None,
+            &test_session_telemetry(),
+            &compact_test_metadata(),
+        )
+        .await
+        .unwrap();
+    session
+        .prewarm_websocket(
+            &Prompt::default(),
+            &test_model_info(),
+            &test_session_telemetry(),
+            None,
+            codex_protocol::config_types::ReasoningSummary::Auto,
+            None,
+            &compact_test_metadata(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.handshakes().len(), 1);
+    let compacted = output_message("compact-input", "complete compacted context");
+    stream_compaction_test_prompt(&mut session, vec![compacted.clone()]).await;
+    assert!(!session.try_switch_compaction_fallback_transport(&test_session_telemetry()));
+    assert!(client.responses_websocket_enabled());
+    assert!(
+        server
+            .wait_for_closed_connections(1, Duration::from_secs(2))
+            .await
+    );
+    stream_compaction_test_prompt(
+        &mut session,
+        vec![compacted, output_message("next", "continue")],
+    )
+    .await;
+    let connections = server.connections();
+    assert_eq!(server.handshakes().len(), 2);
+    assert_eq!(connections.iter().map(Vec::len).sum::<usize>(), 3);
+    let first = connections[1][0].body_json();
+    assert!(first.get("previous_response_id").is_none());
+    assert!(first.get("generate").is_none());
+    assert_eq!(first["input"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        first["input"][0]["content"][0]["text"],
+        "complete compacted context"
+    );
+    assert_eq!(
+        connections[1][1].body_json()["previous_response_id"],
+        "fresh"
+    );
+    assert!(logs_contain("post-compaction WebSocket reconnect"));
+    assert!(logs_contain("result=\"completed\""));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn compaction_reconnect_failed_handshake_uses_http_after_one_attempt() {
+    use core_test_support::responses::{ev_completed, sse};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(vec![ev_completed("http")]), "text/event-stream"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    provider.stream_max_retries = Some(10);
+    let client = test_model_client_with_provider(ThreadId::new(), SessionSource::Cli, provider);
+    client.schedule_websocket_reconnect_after_compaction();
+    let mut session = client.new_session();
+    stream_compaction_test_prompt(&mut session, vec![output_message("1", "compacted context")])
+        .await;
+    stream_compaction_test_prompt(&mut session, vec![output_message("2", "still HTTP")]).await;
+    assert!(!client.responses_websocket_enabled());
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[test_case::test_case(false; "bounded connection retries")]
+#[test_case::test_case(true; "unbounded connection retries")]
+#[tokio::test]
+async fn compaction_reconnect_failed_stream_switches_before_retry_budget_is_exhausted(
+    unbounded: bool,
+) {
+    use core_test_support::responses::{ev_response_created, start_websocket_server};
+    let server = start_websocket_server(vec![vec![vec![ev_response_created("partial")]]]).await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = test_model_client_with_provider(ThreadId::new(), SessionSource::Cli, provider);
+    client.schedule_websocket_reconnect_after_compaction();
+    let mut client_session = client.new_session();
+    let mut stream = client_session
+        .stream(
+            &Prompt::default(),
+            &test_model_info(),
+            &test_session_telemetry(),
+            None,
+            codex_protocol::config_types::ReasoningSummary::Auto,
+            None,
+            &compact_test_metadata(),
+            &InferenceTraceContext::disabled(),
+        )
+        .await
+        .unwrap();
+    let mut failed = false;
+    while let Some(event) = stream.next().await {
+        if event.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+    if unbounded {
+        Arc::make_mut(&mut turn_context.config)
+            .features
+            .enable(codex_features::Feature::UnboundedConnectionRetries)
+            .unwrap();
+    }
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(turn_context));
+    let mut retry = crate::responses_retry::ResponsesStreamRetryState::default();
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        crate::responses_retry::handle_response_stream_error(
+            &mut retry,
+            10,
+            CodexErr::ConnectionFailed(codex_protocol::error::ConnectionFailedError {
+                source: codex_http_client::HttpError::Timeout,
+            }),
+            &mut client_session,
+            &session,
+            &step,
+            crate::responses_retry::ResponsesStreamRequest::Sampling,
+        ),
+    )
+    .await
+    .expect("must switch to HTTP without spending the WS retry budget")
+    .unwrap();
+    assert!(!client.responses_websocket_enabled());
+    assert!(!client_session.try_switch_compaction_fallback_transport(&test_session_telemetry()));
+    assert_eq!(server.handshakes().len(), 1);
+    server.shutdown().await;
+}
+
+#[test_case::test_case(false; "failed compact keeps cooldown")]
+#[test_case::test_case(true; "successful local compact schedules reconnect")]
+#[tokio::test]
+async fn local_compaction_schedules_reconnect_only_after_success(success: bool) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(if success {
+            ResponseTemplate::new(200).set_body_raw(
+                core_test_support::responses::sse(vec![
+                    core_test_support::responses::ev_assistant_message(
+                        "summary",
+                        "compacted context",
+                    ),
+                    core_test_support::responses::ev_completed("compact"),
+                ]),
+                "text/event-stream",
+            )
+        } else {
+            ResponseTemplate::new(400).set_body_string("invalid compact request")
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.supports_websockets = true;
+    provider.stream_max_retries = Some(0);
+    let (session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            Vec::new(),
+            move |config| {
+                config.model = Some("gpt-5.2".into());
+                config.model_provider = provider;
+            },
+        )
+        .await;
+    let client = &session.services.model_client;
+    client.force_http_fallback(&test_session_telemetry(), &test_model_info());
+    let generation = client.websocket_recovery_generation();
+    let step = session
+        .capture_step_context(turn, &tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let world = Arc::new(
+        session
+            .build_world_state_for_step(&step, true)
+            .await
+            .unwrap(),
+    );
+    let result =
+        crate::compact::run_compact_task(Arc::clone(&session), step, world, Vec::new()).await;
+    assert_eq!(result.is_ok(), success);
+    assert!(!client.responses_websocket_enabled());
+    assert_eq!(
+        client
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap()
+            .compaction_reconnect_pending(),
+        success
+    );
+    assert_eq!(
+        client.websocket_recovery_generation(),
+        generation + u64::from(success)
+    );
+}
+
+#[test]
 fn websocket_recovery_is_shared_across_turns_but_respects_provider_capability() {
     let client = test_websocket_model_client();
     let telemetry = test_session_telemetry();
@@ -183,7 +617,7 @@ fn websocket_recovery_is_shared_across_turns_but_respects_provider_capability() 
     turn.websocket_session.last_response_rx = Some(rx);
     assert!(turn.try_switch_fallback_transport(&telemetry, &model));
     assert!(!clone.responses_websocket_enabled());
-    assert!(super::WebsocketCompletion::new(&clone).is_none());
+    assert!(super::WebsocketCompletion::new(&clone, true).is_none());
     assert!(!turn.try_switch_fallback_transport(&telemetry, &model));
     assert!(turn.websocket_session.connection.is_none());
     assert!(turn.websocket_session.last_request.is_none());
@@ -233,7 +667,8 @@ async fn websocket_recovery_resets_cooldown_only_for_completed_generation() {
             .unwrap()
             .activate_fallback(std::time::Instant::now() - std::time::Duration::from_secs(60));
         assert!(client.responses_websocket_enabled());
-        let completion = is_websocket.then(|| super::WebsocketCompletion::new(&client).unwrap());
+        let completion =
+            is_websocket.then(|| super::WebsocketCompletion::new(&client, true).unwrap());
         let (mut stream, _) = super::map_response_events(
             None,
             futures::stream::iter(events),
@@ -332,7 +767,7 @@ async fn websocket_recovery_does_not_interrupt_an_active_http_stream() {
 #[tokio::test]
 async fn websocket_recovery_ignores_completed_from_an_older_stream() {
     let client = test_websocket_model_client();
-    let completion = super::WebsocketCompletion::new(&client).unwrap();
+    let completion = super::WebsocketCompletion::new(&client, true).unwrap();
     assert!(client.force_http_fallback(&test_session_telemetry(), &test_model_info()));
     let (mut stream, _) = super::map_response_events(
         None,
@@ -365,7 +800,7 @@ async fn websocket_recovery_cancelled_stream_keeps_cooldown_sequence() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         Arc::clone(&client.state.provider),
-        super::WebsocketCompletion::new(&client),
+        super::WebsocketCompletion::new(&client, true),
     );
     assert!(stream.next().await.is_some());
     drop(stream);

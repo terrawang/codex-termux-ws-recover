@@ -21,7 +21,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
-          toolchain: "1.95.0"
           components: rustfmt
       - name: Check Rust formatting
         working-directory: codex-rs
@@ -30,11 +29,37 @@ jobs:
         working-directory: codex-rs
         run: |
           cargo test --locked -p codex-core --lib client:: -j 4
+          cargo test --locked -p codex-core --lib responses_retry:: -j 4
+          cargo test --locked -p codex-core --lib compaction_persists_resume_metadata_and_companion_records -j 4
+      - name: Test HTTP and TLS transports
+        working-directory: codex-rs
+        run: |
+          cargo test --locked -p codex-http-client --lib --features reqwest/native-tls --no-run --message-format=json -j 4 > "${RUNNER_TEMP}/http-client-tests.jsonl"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          entries = [json.loads(line) for line in (Path(os.environ["RUNNER_TEMP"]) / "http-client-tests.jsonl").read_text().splitlines()]
+          binaries = [entry["executable"] for entry in entries if entry.get("target", {}).get("name") == "codex_http_client" and entry.get("profile", {}).get("test") and entry.get("executable")]
+          assert len(binaries) == 1, binaries
+          # Local TLS fixtures require the default native backend. A cloud CA
+          # override forces Rustls; isolate only the test process and keep
+          # certificate verification enabled with system/test roots.
+          test_env = os.environ.copy()
+          test_env["CODEX_CA_CERTIFICATE"] = ""
+          test_env["SSL_CERT_FILE"] = ""
+          subprocess.run([binaries[0], "--test-threads=1"], env=test_env, check=True)
+          PY
       - name: Build Linux sandbox test helper
         working-directory: codex-rs
         run: cargo build --locked -p codex-linux-sandbox -j 4
       - name: Test fallback requests and session routing
         working-directory: codex-rs
-        run: cargo test --locked -p codex-core --test all websocket_fallback -j 4
+        run: |
+          cargo test --locked -p codex-core --test all websocket_fallback -j 4
+          cargo test --locked -p codex-core --test all remote_mid_turn_compact_v2_sends_turn_state_over_websocket -j 4
+          cargo test --locked -p codex-core --test all client_websockets -j 4
       - name: Test Termux launchers
         run: node --test npm-package/tests/*.test.mjs
