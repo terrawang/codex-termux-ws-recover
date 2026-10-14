@@ -6230,7 +6230,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
                 message: String::new(),
                 window_number,
                 window_ids,
-                compaction_response_id: None,
+                compaction_response_id: Some("completed-compaction".to_string()),
                 compaction_model_hash: None,
                 reviewer_compaction_hash: None,
             },

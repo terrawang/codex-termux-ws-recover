@@ -118,6 +118,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -297,6 +298,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    compaction_attempt: Option<Arc<CompactionReconnectAttempt>>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -623,6 +625,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session,
+            compaction_attempt: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -691,12 +694,23 @@ impl ModelClient {
         session_telemetry: &SessionTelemetry,
         _model_info: &ModelInfo,
     ) -> bool {
+        self.force_http_fallback_for_generation(session_telemetry, None)
+    }
+
+    fn force_http_fallback_for_generation(
+        &self,
+        session_telemetry: &SessionTelemetry,
+        expected_generation: Option<u64>,
+    ) -> bool {
         let activated = {
             let mut recovery = self
                 .state
                 .websocket_recovery
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if expected_generation.is_some_and(|generation| generation != recovery.generation()) {
+                return false;
+            }
             let activated = self.state.provider.info().supports_websockets
                 && recovery.activate_fallback(Instant::now());
             *self
@@ -719,6 +733,46 @@ impl ModelClient {
         }
 
         activated
+    }
+
+    /// Installed compacted history invalidates transport state, never thread/goal/tool state.
+    /// The next normal request owns the single reconnect; warmup must not consume it.
+    pub(crate) fn schedule_websocket_reconnect_after_compaction(&self) {
+        if !self.state.provider.info().supports_websockets {
+            return;
+        }
+        let mut recovery = self
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.schedule_compaction_reconnect();
+        let mut cache = self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cache = WebsocketSession {
+            recovery_generation: recovery.generation(),
+            auth_owner_generation: cache.auth_owner_generation,
+            continuation_reset_reason: Some("compaction"),
+            ..Default::default()
+        };
+        info!(
+            generation = recovery.generation(),
+            "scheduled WebSocket reconnect after compaction"
+        );
+    }
+
+    fn websocket_prewarm_allowed(&self) -> bool {
+        let recovery = self
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.state.provider.info().supports_websockets
+            && !recovery.compaction_reconnect_pending()
+            && recovery.enabled(Instant::now())
     }
 
     pub(crate) async fn create_realtime_call_with_headers(
@@ -1521,7 +1575,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.client.websocket_prewarm_allowed() {
             return Ok(());
         }
         let provider = Arc::clone(&self.client.state.provider);
@@ -1914,13 +1968,21 @@ impl ModelClientSession {
         inference_trace: &InferenceTraceContext,
         websocket_completion: Option<WebsocketCompletion>,
     ) -> Result<WebsocketStreamOutcome> {
+        let after_compaction = websocket_completion
+            .as_ref()
+            .is_some_and(|completion| completion.compaction_attempt.is_some());
         let recovery_generation = websocket_completion.as_ref().map_or_else(
             || self.client.websocket_recovery_generation(),
             |completion| completion.generation,
         );
-        if self.websocket_session.recovery_generation != recovery_generation {
+        if after_compaction || self.websocket_session.recovery_generation != recovery_generation {
+            if let Some(connection) = self.websocket_session.connection.take() {
+                connection.close().await;
+            }
             self.websocket_session = WebsocketSession {
                 recovery_generation,
+                auth_owner_generation: self.websocket_session.auth_owner_generation,
+                continuation_reset_reason: after_compaction.then_some("compaction"),
                 ..Default::default()
             };
         }
@@ -1997,7 +2059,21 @@ impl ModelClientSession {
                 })
                 .await
             {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(completion) = &websocket_completion {
+                        completion.record_reconnect_result("connected", session_telemetry);
+                    }
+                }
+                Err(err) if after_compaction => {
+                    if let Some(completion) = &websocket_completion {
+                        completion.record_reconnect_result("failed", session_telemetry);
+                    }
+                    warn!(error = %err, "post-compaction WebSocket connect failed; using HTTP");
+                    if let Some(retry_after) = provider.map_api_error(err).retry_after() {
+                        tokio::time::sleep_until(retry_after.deadline()).await;
+                    }
+                    return Ok(WebsocketStreamOutcome::FallbackToHttp);
+                }
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UPGRADE_REQUIRED =>
                 {
@@ -2245,7 +2321,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.client.websocket_prewarm_allowed() {
             return Ok(());
         }
         if self.is_websocket_prewarmed().await {
@@ -2308,10 +2384,21 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.compaction_attempt = None;
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if let Some(websocket_completion) = WebsocketCompletion::new(&self.client) {
+                let normal_request = matches!(
+                    responses_metadata.request_kind,
+                    None | Some(crate::responses_metadata::CodexResponsesRequestKind::Turn)
+                );
+                if let Some(websocket_completion) =
+                    WebsocketCompletion::new(&self.client, normal_request)
+                {
+                    if websocket_completion.compaction_attempt.is_some() {
+                        self.compaction_attempt = websocket_completion.compaction_attempt.clone();
+                        websocket_completion.record_reconnect_result("started", session_telemetry);
+                    }
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2331,7 +2418,11 @@ impl ModelClientSession {
                     {
                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
                         WebsocketStreamOutcome::FallbackToHttp => {
-                            self.try_switch_fallback_transport(session_telemetry, model_info);
+                            if self.compaction_attempt.is_some() {
+                                self.try_switch_compaction_fallback_transport(session_telemetry);
+                            } else {
+                                self.try_switch_fallback_transport(session_telemetry, model_info);
+                            }
                         }
                     }
                 }
@@ -2370,6 +2461,30 @@ impl ModelClientSession {
             recovery_generation: self.client.websocket_recovery_generation(),
             ..Default::default()
         };
+        activated
+    }
+
+    /// A failed post-compact stream gets one WS attempt, even with unbounded network retries.
+    pub(crate) fn try_switch_compaction_fallback_transport(
+        &mut self,
+        session_telemetry: &SessionTelemetry,
+    ) -> bool {
+        let Some(attempt) = self.compaction_attempt.take() else {
+            return false;
+        };
+        // Errors from tool execution after response.completed are not WS failures.
+        if attempt.completed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let activated = self
+            .client
+            .force_http_fallback_for_generation(session_telemetry, Some(attempt.generation));
+        if activated {
+            self.websocket_session = WebsocketSession {
+                recovery_generation: self.client.websocket_recovery_generation(),
+                ..Default::default()
+            };
+        }
         activated
     }
 }
@@ -2434,35 +2549,71 @@ const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
 
 /// A completion from an older stream must not undo a more recent fallback.
+struct CompactionReconnectAttempt {
+    generation: u64,
+    completed: std::sync::atomic::AtomicBool,
+}
+
 struct WebsocketCompletion {
     state: Arc<ModelClientState>,
     generation: u64,
+    compaction_attempt: Option<Arc<CompactionReconnectAttempt>>,
 }
 
 impl WebsocketCompletion {
     /// Select transport and capture its generation under the same lock. A concurrent
     /// fallback between selection and connection must not label this as a new stream.
-    fn new(client: &ModelClient) -> Option<Self> {
+    fn new(client: &ModelClient, normal_request: bool) -> Option<Self> {
         if !client.state.provider.info().supports_websockets {
             return None;
         }
-        let recovery = client
+        let mut recovery = client
             .state
             .websocket_recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recovery.compaction_reconnect_pending() && !normal_request {
+            return None;
+        }
+        let after_compaction = normal_request && recovery.take_compaction_reconnect();
         recovery.enabled(Instant::now()).then(|| Self {
             state: Arc::clone(&client.state),
             generation: recovery.generation(),
+            compaction_attempt: after_compaction.then(|| {
+                Arc::new(CompactionReconnectAttempt {
+                    generation: recovery.generation(),
+                    completed: std::sync::atomic::AtomicBool::new(false),
+                })
+            }),
         })
     }
 
-    fn record_completed(&self) {
+    fn record_completed(&self, session_telemetry: &SessionTelemetry) {
+        if let Some(attempt) = &self.compaction_attempt {
+            attempt
+                .completed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.state
             .websocket_recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_completed(self.generation);
+        self.record_reconnect_result("completed", session_telemetry);
+    }
+
+    fn record_reconnect_result(&self, result: &'static str, session_telemetry: &SessionTelemetry) {
+        if self.compaction_attempt.is_some() {
+            info!(
+                generation = self.generation,
+                result, "post-compaction WebSocket reconnect"
+            );
+            session_telemetry.counter(
+                "codex.transport.compaction_reconnect",
+                1,
+                &[("result", result)],
+            );
+        }
     }
 }
 
@@ -2510,6 +2661,7 @@ where
 
     tokio::spawn(async move {
         let mut logged_error = false;
+        let mut completed = false;
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let (request_start, mut ttft_ms) = (Instant::now(), None);
@@ -2555,8 +2707,9 @@ where
                     usage_metadata,
                     end_turn,
                 }) => {
+                    completed = true;
                     if let Some(completion) = &websocket_completion {
-                        completion.record_completed();
+                        completion.record_completed(&session_telemetry);
                     }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
@@ -2603,6 +2756,12 @@ where
                     }
                 }
                 Err(err) => {
+                    if !completed
+                        && !logged_error
+                        && let Some(completion) = &websocket_completion
+                    {
+                        completion.record_reconnect_result("failed", &session_telemetry);
+                    }
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
                     let upstream_request_id =
@@ -2625,6 +2784,12 @@ where
                     }
                 }
             }
+        }
+        if !completed
+            && !logged_error
+            && let Some(completion) = &websocket_completion
+        {
+            completion.record_reconnect_result("failed", &session_telemetry);
         }
         inference_trace_attempt.record_failed(
             "stream closed before response.completed",

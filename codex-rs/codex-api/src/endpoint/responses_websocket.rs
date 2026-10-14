@@ -231,6 +231,15 @@ impl ResponsesWebsocketConnection {
             .is_none_or(|stream| stream.pump_task.is_finished())
     }
 
+    /// Release an idle connection before replacing its request continuation state.
+    pub async fn close(&self) {
+        let stream = self.stream.lock().await.take();
+        if let Some(mut stream) = stream {
+            stream.pump_task.abort();
+            let _ = (&mut stream.pump_task).await;
+        }
+    }
+
     #[instrument(
         name = "responses_websocket.stream_request",
         level = "info",

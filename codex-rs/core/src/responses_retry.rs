@@ -89,11 +89,14 @@ pub(crate) async fn handle_response_stream_error(
         return Err(err);
     };
     let retry_after = err.retry_after();
+    let compaction_fallback =
+        client_session.try_switch_compaction_fallback_transport(&turn_context.session_telemetry);
 
-    if turn_context
-        .config
-        .features
-        .enabled(Feature::UnboundedConnectionRetries)
+    if !compaction_fallback
+        && turn_context
+            .config
+            .features
+            .enabled(Feature::UnboundedConnectionRetries)
         && matches!(request, ResponsesStreamRequest::Sampling)
         && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
         && !turn_context.session_source.is_internal()
@@ -117,11 +120,12 @@ pub(crate) async fn handle_response_stream_error(
         return Ok(());
     }
 
-    if retry_state.retries >= max_retries
-        && client_session.try_switch_fallback_transport(
-            &turn_context.session_telemetry,
-            turn_context.model_info(),
-        )
+    if compaction_fallback
+        || (retry_state.retries >= max_retries
+            && client_session.try_switch_fallback_transport(
+                &turn_context.session_telemetry,
+                turn_context.model_info(),
+            ))
     {
         // Changing transport must not bypass the server's retry deadline.
         if let Some(retry_after) = retry_after {

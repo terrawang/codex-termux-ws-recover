@@ -4021,6 +4021,7 @@ impl Session {
         world_state_baseline: WorldStateSnapshot,
         metadata: CompactedHistoryMetadata,
     ) {
+        let completed_compaction = metadata.compaction_response_id.is_some();
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -4121,6 +4122,11 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        }
+        if completed_compaction {
+            self.services
+                .model_client
+                .schedule_websocket_reconnect_after_compaction();
         }
     }
 

@@ -23,6 +23,20 @@ WebSocket continuation state so recovery cannot reuse a stale `previous_response
 These defaults require no new configuration. Providers with WebSocket support
 disabled continue to use HTTP.
 
+After successful compaction (local, remote, or token-budget), the next normal model request gets
+one fresh WebSocket connection attempt, bypassing an active HTTP cooldown. It
+closes the previous socket and clears cached requests, response IDs, and warmup
+continuations, so the request sends the complete compacted context. Prewarm and
+further compaction requests cannot consume this attempt. If connection setup or
+the resulting stream fails, normal HTTP fallback and cooldown behavior resumes.
+Only a real WebSocket `response.completed` resets the cooldown sequence.
+
+This reconnect adds no inference probes, does not replay tool execution, and
+preserves thread identity, goals, and the current turn's sticky routing token.
+Logs and the `codex.transport.compaction_reconnect` counter record `started`,
+`connected`, `completed`, and `failed` results. These describe the client's
+WebSocket transport; upstream bridge routing remains observable by the relay.
+
 ## Lifecycle hooks
 
 Admins can set top-level `allow_managed_hooks_only = true` in
