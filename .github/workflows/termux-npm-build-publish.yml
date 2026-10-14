@@ -6,6 +6,8 @@
 name: termux-npm-build-publish
 
 on:
+  # For a PR, dispatch this workflow with its branch as the ref when an Android
+  # artifact is needed. CI/documentation-only pushes do not rebuild the payload.
   push:
     branches:
       - main
@@ -216,6 +218,7 @@ jobs:
           ls -lh "${package_tgz}" "${package_tgz}.sha256"
 
       - name: Upload npm tarball artifact
+        id: package_artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-cli-termux-android-arm64-${{ env.PACKAGE_VERSION }}
@@ -223,6 +226,17 @@ jobs:
             ${{ env.PACKAGE_TGZ }}
             ${{ env.PACKAGE_SHA256_FILE }}
           if-no-files-found: error
+
+      - name: Add artifact download to run summary
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ steps.package_artifact.outputs.artifact-url }}
+        run: |
+          {
+            echo "Android arm64 package built from commit ${GITHUB_SHA}."
+            echo ""
+            echo "[Download installable npm tarball and SHA-256 checksum](${ARTIFACT_URL})"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # npm publish intentionally removed: publishing is performed locally with
       # ~/.npmrc on the maintainer's release host, never from CI. The Android

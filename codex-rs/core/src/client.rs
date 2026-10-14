@@ -29,11 +29,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 #[path = "client_tool_metadata.rs"]
 mod tool_metadata;
+
+#[path = "client_websocket_recovery.rs"]
+mod websocket_recovery;
+use websocket_recovery::WebsocketRecovery;
 
 use crate::CodexResponsesHeaders;
 use crate::tools::ExecutedToolCalls;
@@ -215,7 +217,7 @@ struct ModelClientState {
     concurrent_reasoning_summaries_enabled: bool,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
-    disable_websockets: AtomicBool,
+    websocket_recovery: StdMutex<WebsocketRecovery>,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
     /// Last full tool list used for sampling, retained across turns and connection resets.
@@ -258,7 +260,8 @@ impl RequestRouteTelemetry {
 /// (auth, provider selection, thread id, and transport fallback state).
 ///
 /// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
-/// will also use HTTP for the remainder of the session.
+/// use HTTP until a recovery cooldown expires. Recovery uses the next request;
+/// it never interrupts an active stream or sends an extra inference request.
 ///
 /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
 /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
@@ -322,6 +325,8 @@ struct WebsocketContinuation {
 
 #[derive(Debug, Default)]
 struct WebsocketSession {
+    /// A late turn must not restore continuation state invalidated by fallback.
+    recovery_generation: u64,
     connection: Option<ApiWebSocketConnection>,
     responses_headers: ApiHeaderMap,
     /// Owner of the cached state, including before a connection is opened.
@@ -420,6 +425,7 @@ impl WebsocketSession {
             .continuation_reset_reason
             .or_else(|| self.last_request.as_ref().and(reason));
         *self = Self {
+            recovery_generation: self.recovery_generation,
             auth_owner_generation: self.auth_owner_generation,
             continuation_reset_reason,
             ..Default::default()
@@ -530,7 +536,7 @@ impl ModelClient {
                 concurrent_reasoning_summaries_enabled,
                 include_attestation,
                 attestation_provider,
-                disable_websockets: AtomicBool::new(false),
+                websocket_recovery: StdMutex::new(WebsocketRecovery::default()),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 last_inference_tools: StdMutex::new(None),
@@ -635,15 +641,36 @@ impl ModelClient {
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
+        let recovery = self
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut cached_websocket_session = self
             .state
             .cached_websocket_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *cached_websocket_session)
+        let session = std::mem::take(&mut *cached_websocket_session);
+        if session.recovery_generation == recovery.generation() {
+            session
+        } else {
+            WebsocketSession {
+                recovery_generation: recovery.generation(),
+                ..Default::default()
+            }
+        }
     }
 
     fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
+        let recovery = self
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if websocket_session.recovery_generation != recovery.generation() {
+            return;
+        }
         *self
             .state
             .cached_websocket_session
@@ -651,14 +678,37 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
+    fn websocket_recovery_generation(&self) -> u64 {
+        self.state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation()
+    }
+
     pub(crate) fn force_http_fallback(
         &self,
         session_telemetry: &SessionTelemetry,
         _model_info: &ModelInfo,
     ) -> bool {
-        let websocket_enabled = self.responses_websocket_enabled();
-        let activated =
-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+        let activated = {
+            let mut recovery = self
+                .state
+                .websocket_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let activated = self.state.provider.info().supports_websockets
+                && recovery.activate_fallback(Instant::now());
+            *self
+                .state
+                .cached_websocket_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = WebsocketSession {
+                recovery_generation: recovery.generation(),
+                ..Default::default()
+            };
+            activated
+        };
         if activated {
             warn!("falling back to HTTP");
             session_telemetry.counter(
@@ -668,7 +718,6 @@ impl ModelClient {
             );
         }
 
-        self.store_cached_websocket_session(WebsocketSession::default());
         activated
     }
 
@@ -1028,13 +1077,13 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
-            || self.state.disable_websockets.load(Ordering::Relaxed)
-        {
-            return false;
-        }
-
-        true
+        self.state.provider.info().supports_websockets
+            && self
+                .state
+                .websocket_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .enabled(Instant::now())
     }
 
     /// Returns auth + provider configuration resolved from the current session auth state.
@@ -1788,6 +1837,7 @@ impl ModelClientSession {
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
+                        None,
                         interceptors,
                     );
                     return Ok(stream);
@@ -1862,7 +1912,18 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        websocket_completion: Option<WebsocketCompletion>,
     ) -> Result<WebsocketStreamOutcome> {
+        let recovery_generation = websocket_completion.as_ref().map_or_else(
+            || self.client.websocket_recovery_generation(),
+            |completion| completion.generation,
+        );
+        if self.websocket_session.recovery_generation != recovery_generation {
+            self.websocket_session = WebsocketSession {
+                recovery_generation,
+                ..Default::default()
+            };
+        }
         let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -2118,6 +2179,7 @@ impl ModelClientSession {
                 request_session_telemetry,
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
+                websocket_completion,
                 interceptors,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
@@ -2203,6 +2265,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                None,
             )
             .await
         {
@@ -2248,7 +2311,7 @@ impl ModelClientSession {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
+                if let Some(websocket_completion) = WebsocketCompletion::new(&self.client) {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2262,6 +2325,7 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            Some(websocket_completion),
                         )
                         .await?
                     {
@@ -2287,10 +2351,11 @@ impl ModelClientSession {
         }
     }
 
-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+    /// Activates an HTTP cooldown and resets cached WebSocket state.
     ///
     /// This is used after exhausting the provider retry budget, to force subsequent requests onto
-    /// the HTTP transport.
+    /// the HTTP transport. Recovery windows are 1, 5, 15, then repeatedly 30 minutes.
+    /// Only a completed WebSocket generation resets this sequence.
     ///
     /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
     pub(crate) fn try_switch_fallback_transport(
@@ -2301,7 +2366,10 @@ impl ModelClientSession {
         let activated = self
             .client
             .force_http_fallback(session_telemetry, model_info);
-        self.websocket_session = WebsocketSession::default();
+        self.websocket_session = WebsocketSession {
+            recovery_generation: self.client.websocket_recovery_generation(),
+            ..Default::default()
+        };
         activated
     }
 }
@@ -2365,11 +2433,45 @@ fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: boo
 const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
 const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
 
+/// A completion from an older stream must not undo a more recent fallback.
+struct WebsocketCompletion {
+    state: Arc<ModelClientState>,
+    generation: u64,
+}
+
+impl WebsocketCompletion {
+    /// Select transport and capture its generation under the same lock. A concurrent
+    /// fallback between selection and connection must not label this as a new stream.
+    fn new(client: &ModelClient) -> Option<Self> {
+        if !client.state.provider.info().supports_websockets {
+            return None;
+        }
+        let recovery = client
+            .state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recovery.enabled(Instant::now()).then(|| Self {
+            state: Arc::clone(&client.state),
+            generation: recovery.generation(),
+        })
+    }
+
+    fn record_completed(&self) {
+        self.state
+            .websocket_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_completed(self.generation);
+    }
+}
+
 fn map_response_stream(
     mut api_stream: codex_api::ResponseStream,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    websocket_completion: Option<WebsocketCompletion>,
     interceptors: Vec<Box<dyn codex_extension_api::ModelResponseInterceptor>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let upstream_request_id = api_stream.upstream_request_id.take();
@@ -2380,6 +2482,7 @@ fn map_response_stream(
         session_telemetry,
         inference_trace_attempt,
         provider,
+        websocket_completion,
     );
     stream.interrupt = interrupt;
     (stream, last_response)
@@ -2391,6 +2494,7 @@ fn map_response_events<S>(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    websocket_completion: Option<WebsocketCompletion>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -2451,6 +2555,9 @@ where
                     usage_metadata,
                     end_turn,
                 }) => {
+                    if let Some(completion) = &websocket_completion {
+                        completion.record_completed();
+                    }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(usage, ttft_ms);

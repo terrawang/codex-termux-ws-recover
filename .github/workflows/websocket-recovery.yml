@@ -1,0 +1,40 @@
+name: WebSocket recovery
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt --all -- --check
+      - name: Test client state, stream completion and fallback
+        working-directory: codex-rs
+        run: |
+          cargo test --locked -p codex-core --lib client:: -j 4
+      - name: Build Linux sandbox test helper
+        working-directory: codex-rs
+        run: cargo build --locked -p codex-linux-sandbox -j 4
+      - name: Test fallback requests and session routing
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-core --test all websocket_fallback -j 4
+      - name: Test Termux launchers
+        run: node --test npm-package/tests/*.test.mjs

@@ -207,7 +207,7 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+async fn websocket_fallback_is_sticky_during_cooldown_across_turns() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
