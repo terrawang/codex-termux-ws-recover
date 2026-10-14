@@ -338,10 +338,10 @@ async fn stream_compaction_test_prompt(
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn compaction_reconnect_closes_old_socket_and_sends_full_context_once() {
-    use core_test_support::responses::{
-        WebSocketConnectionConfig, ev_completed, ev_response_created,
-        start_websocket_server_with_headers,
-    };
+    use core_test_support::responses::WebSocketConnectionConfig;
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::start_websocket_server_with_headers;
     let server = start_websocket_server_with_headers(vec![
         WebSocketConnectionConfig {
             // The unused slot keeps the peer reading until the client closes it.
@@ -434,7 +434,8 @@ async fn compaction_reconnect_closes_old_socket_and_sends_full_context_once() {
 
 #[tokio::test]
 async fn compaction_reconnect_failed_handshake_uses_http_after_one_attempt() {
-    use core_test_support::responses::{ev_completed, sse};
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::sse;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/responses"))
@@ -471,7 +472,8 @@ async fn compaction_reconnect_failed_handshake_uses_http_after_one_attempt() {
 async fn compaction_reconnect_failed_stream_switches_before_retry_budget_is_exhausted(
     unbounded: bool,
 ) {
-    use core_test_support::responses::{ev_response_created, start_websocket_server};
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::start_websocket_server;
     let server = start_websocket_server(vec![vec![vec![ev_response_created("partial")]]]).await;
     let mut provider =
         create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
